@@ -1,0 +1,30 @@
+name: Refresh Instagram tokens
+
+on:
+  schedule:
+    - cron: "23 6 1,15 * *" # twice a month; tokens last ~60 days
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Refresh and save tokens
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }} # fine-grained PAT: this repo, Secrets read/write
+          # Add one line per account
+          IG_TOKEN_VINTAGE: ${{ secrets.IG_TOKEN_VINTAGE }}
+        run: python scripts/publish.py refresh-tokens

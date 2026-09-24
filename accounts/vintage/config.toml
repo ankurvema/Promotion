@@ -1,0 +1,6 @@
+# Settings for the vintage Instagram account.
+# Secrets for this folder: IG_USER_ID_VINTAGE and IG_TOKEN_VINTAGE
+enabled = true
+start_date = 2026-10-01           # first day to post
+timezone = "America/New_York"     # your local time zone
+post_hour = 9                     # posts once a day, at the first run after 9:00 local

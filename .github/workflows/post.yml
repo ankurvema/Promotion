@@ -1,0 +1,66 @@
+name: Post to Instagram
+
+on:
+  schedule:
+    - cron: "17 * * * *" # hourly; each account posts once a day at its own local hour
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Validate only, don't publish"
+        type: boolean
+        default: true
+      force:
+        description: "Ignore the schedule and post the next carousel now"
+        type: boolean
+        default: false
+      account:
+        description: "Only this account folder (blank = all)"
+        type: string
+        default: ""
+
+permissions:
+  contents: write # to commit posted.json
+
+concurrency:
+  group: instagram-post
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Publish due carousels
+        env:
+          # Add two lines per account: IG_USER_ID_<FOLDER> and IG_TOKEN_<FOLDER>
+          IG_USER_ID_VINTAGE: ${{ secrets.IG_USER_ID_VINTAGE }}
+          IG_TOKEN_VINTAGE: ${{ secrets.IG_TOKEN_VINTAGE }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          FORCE: ${{ inputs.force }}
+          ACCOUNT: ${{ inputs.account }}
+        run: |
+          args=()
+          [[ "$DRY_RUN" == "true" ]] && args+=(--dry-run)
+          [[ "$FORCE" == "true" ]] && args+=(--force)
+          [[ -n "$ACCOUNT" ]] && args+=(--account "$ACCOUNT")
+          python scripts/publish.py run "${args[@]}"
+
+      - name: Save posting log
+        if: always()
+        run: |
+          find accounts -name posted.json -exec git add {} +
+          git diff --cached --quiet && exit 0
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Log published posts"
+          git pull --rebase
+          git push
