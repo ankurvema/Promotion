@@ -28,6 +28,7 @@ from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import requests
+from PIL import Image, UnidentifiedImageError
 
 API_VERSION = os.environ.get("IG_API_VERSION", "v26.0")
 GRAPH_URL = f"https://graph.instagram.com/{API_VERSION}"
@@ -42,6 +43,7 @@ MIN_SLIDES, MAX_SLIDES = 2, 10  # API carousel limits
 MAX_CAPTION_CHARS = 2200
 MAX_HASHTAGS = 30
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
+MIN_ASPECT, MAX_ASPECT = 4 / 5, 1.91  # width / height the API accepts
 HTTP_TIMEOUT = 30
 POLL_INTERVAL = 5
 POLL_TIMEOUT = 300
@@ -91,6 +93,20 @@ class Account:
         return sorted(p for p in posts.iterdir() if p.is_dir())
 
 
+def _image_problem(path: Path) -> str | None:
+    """Catch what Instagram rejects: non-JPEG data or an out-of-range aspect ratio."""
+    try:
+        with Image.open(path) as img:
+            fmt, (width, height) = img.format, img.size
+    except (OSError, UnidentifiedImageError):
+        return f"{path.name} is not a readable image"
+    if fmt != "JPEG":
+        return f"{path.name} is really a {fmt}, not a JPEG (re-export it)"
+    if not MIN_ASPECT <= width / height <= MAX_ASPECT:
+        return f"{path.name} is {width}x{height}; aspect ratio must be 4:5 to 1.91:1"
+    return None
+
+
 def _slide_order(path: Path) -> tuple[int, int, str]:
     """Sort 1.jpg, 2.jpg ... 10.jpg numerically, anything else by name after."""
     return (0, int(path.stem), "") if path.stem.isdigit() else (1, 0, path.name.lower())
@@ -135,6 +151,7 @@ class Post:
             for s in self.slides
             if s.stat().st_size > MAX_IMAGE_BYTES
         )
+        issues.extend(filter(None, map(_image_problem, self.slides)))
         if not self.caption:
             issues.append("missing caption.txt")
         if len(self.caption) > MAX_CAPTION_CHARS:

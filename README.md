@@ -28,4 +28,5 @@ Create a fine-grained personal access token limited to this repo with
 
 ## Test before going live
 Actions → **Post to Instagram** → Run workflow with *dry run* checked.
-Locally: `python scripts/publish.py check`
+Locally: `pip install -r requirements.txt && python scripts/publish.py check`
+(flags non-JPEGs, including PNGs renamed to .jpg, and slides outside 4:5 to 1.91:1).
