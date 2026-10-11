@@ -54,6 +54,13 @@ class PublishError(RuntimeError):
     """A post could not be published."""
 
 
+class RateLimitError(PublishError):
+    """Instagram throttled us; safe to retry on a later run."""
+
+
+RATE_LIMIT_CODES = frozenset({4, 17, 32, 613})
+
+
 # --------------------------------------------------------------------------
 # Repo content
 # --------------------------------------------------------------------------
@@ -168,16 +175,23 @@ def load_accounts(only: list[str] | None = None) -> list[Account]:
     return accounts
 
 
-def read_log(account: Account) -> list[dict]:
+def read_state(account: Account) -> dict:
+    """Load posted.json: {"posted": [...], "pending": {...} | absent}."""
     if not account.log_path.is_file():
-        return []
-    return json.loads(account.log_path.read_text(encoding="utf-8")).get("posted", [])
+        return {"posted": []}
+    state = json.loads(account.log_path.read_text(encoding="utf-8"))
+    state.setdefault("posted", [])
+    return state
 
 
-def write_log(account: Account, entries: list[dict]) -> None:
-    account.log_path.write_text(
-        json.dumps({"posted": entries}, indent=2) + "\n", encoding="utf-8"
-    )
+def read_log(account: Account) -> list[dict]:
+    return read_state(account)["posted"]
+
+
+def write_state(account: Account, state: dict) -> None:
+    if not state.get("pending"):
+        state.pop("pending", None)
+    account.log_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
 
 
 def is_due(account: Account, entries: list[dict], now: datetime) -> bool:
@@ -212,11 +226,11 @@ class InstagramClient:
         self._token = token
         self._http = requests.Session()
 
-    def _call(self, method: str, path: str, **params: str) -> dict:
+    def _call(self, method: str, path: str, *, retries: int = RETRIES, **params: str) -> dict:
         params["access_token"] = self._token
         payload = {"params": params} if method == "GET" else {"data": params}
         error = "unknown error"
-        for attempt in range(1, RETRIES + 1):
+        for attempt in range(1, retries + 1):
             try:
                 resp = self._http.request(
                     method, f"{GRAPH_URL}/{path}", timeout=HTTP_TIMEOUT, **payload
@@ -230,9 +244,11 @@ class InstagramClient:
                     return body
                 err = body.get("error", {})
                 error = f"HTTP {resp.status_code}: {err.get('message', resp.reason)}"
+                if err.get("code") in RATE_LIMIT_CODES or "request limit" in error:
+                    raise RateLimitError(f"{method} {path} throttled: {error}")
                 if resp.status_code < 500 and not err.get("is_transient"):
                     break  # client error; retrying won't help
-            if attempt < RETRIES:
+            if attempt < retries:
                 time.sleep(2**attempt)
         raise PublishError(f"{method} {path} failed: {error}")
 
@@ -263,9 +279,20 @@ class InstagramClient:
                 raise PublishError(f"container {container_id} not ready after {POLL_TIMEOUT}s")
             time.sleep(POLL_INTERVAL)
 
+    def container_status(self, container_id: str) -> str:
+        info = self._call("GET", container_id, fields="status_code")
+        return info.get("status_code", "")
+
+    def latest_media_id(self) -> str:
+        data = self._call("GET", f"{self._user_id}/media", fields="id", limit="1")
+        items = data.get("data") or []
+        return items[0]["id"] if items else ""
+
     def publish(self, container_id: str) -> str:
+        """Publish once. Never retried here: a lost response may still have gone live,
+        so the caller must check container_status before trying again."""
         return self._call(
-            "POST", f"{self._user_id}/media_publish", creation_id=container_id
+            "POST", f"{self._user_id}/media_publish", retries=1, creation_id=container_id
         )["id"]
 
 
@@ -282,7 +309,7 @@ def ensure_reachable(urls: list[str]) -> None:
             )
 
 
-def publish_post(client: InstagramClient, post: Post, repo: str, ref: str) -> str:
+def create_container(client: InstagramClient, post: Post, repo: str, ref: str) -> str:
     urls = [raw_url(s, repo, ref) for s in post.slides]
     ensure_reachable(urls)
     children = []
@@ -292,7 +319,31 @@ def publish_post(client: InstagramClient, post: Post, repo: str, ref: str) -> st
         children.append(child)
     carousel = client.create_carousel(children, post.caption)
     client.wait_until_ready(carousel)
-    return client.publish(carousel)
+    return carousel
+
+
+def finish_publish(client: InstagramClient, container_id: str) -> str | None:
+    """Publish a ready container exactly once.
+
+    Returns the media id, or None when Instagram already published it (e.g. an
+    earlier run published but errored before we could record it).
+    """
+    try:
+        status = client.container_status(container_id)
+    except PublishError:
+        status = ""  # status check failed; fall through and try to publish
+    if status == "PUBLISHED":
+        return client.latest_media_id() or None
+    try:
+        return client.publish(container_id)
+    except PublishError:
+        # The call may have succeeded server-side despite the error.
+        try:
+            if client.container_status(container_id) == "PUBLISHED":
+                return client.latest_media_id() or None
+        except PublishError:
+            pass
+        raise
 
 
 # --------------------------------------------------------------------------
@@ -304,18 +355,22 @@ def _run_account(account: Account, args: argparse.Namespace, now: datetime) -> N
     if not account.enabled:
         log.info("[%s] disabled, skipping", account.name)
         return
-    entries = read_log(account)
-    if not (args.force or is_due(account, entries, now)):
+    state = read_state(account)
+    entries = state["posted"]
+    pending = state.get("pending")
+    if not (args.force or pending or is_due(account, entries, now)):
         log.info("[%s] nothing due right now", account.name)
         return
 
     done = {e["post"] for e in entries}
-    pending = [d for d in account.post_dirs() if d.name not in done]
-    if not pending:
+    posts = [d for d in account.post_dirs() if d.name not in done]
+    if not posts:
         log.warning("[%s] no posts left to publish", account.name)
         return
 
-    post = Post.load(pending[0])
+    # Resume an interrupted publish first so the same post is never created twice.
+    folder = next((d for d in posts if pending and d.name == pending["post"]), posts[0])
+    post = Post.load(folder)
     if problems := post.problems():
         raise PublishError(f"post {post.id}: {'; '.join(problems)}")
     if args.dry_run:
@@ -326,17 +381,32 @@ def _run_account(account: Account, args: argparse.Namespace, now: datetime) -> N
     user_id = os.environ.get(account.user_id_var)
     if not (token and user_id):
         raise PublishError(f"missing secrets {account.token_var} / {account.user_id_var}")
+    client = InstagramClient(user_id, token)
 
-    media_id = publish_post(InstagramClient(user_id, token), post, args.repo, args.ref)
+    if pending and pending["post"] == post.id:
+        container_id = pending["container_id"]
+        log.info("[%s] resuming %s (container %s)", account.name, post.id, container_id)
+        if client.container_status(container_id) in {"ERROR", "EXPIRED"}:
+            container_id = ""
+    else:
+        container_id = ""
+    if not container_id:
+        container_id = create_container(client, post, args.repo, args.ref)
+        # Persist before publishing: if publish errors, the next run resumes this container.
+        state["pending"] = {"post": post.id, "container_id": container_id}
+        write_state(account, state)
+
+    media_id = finish_publish(client, container_id)
     entries.append(
         {
             "post": post.id,
-            "media_id": media_id,
+            "media_id": media_id or "unknown",
             "published_at": now.isoformat(timespec="seconds"),
             "local_date": now.astimezone(account.tz).date().isoformat(),
         }
     )
-    write_log(account, entries)
+    state.pop("pending", None)
+    write_state(account, state)
     log.info("[%s] published %s -> media %s", account.name, post.id, media_id)
 
 
@@ -352,6 +422,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     for account in load_accounts(args.account):
         try:
             _run_account(account, args, now)
+        except RateLimitError as exc:
+            # Not a failure: the pending container is kept and retried next hour.
+            log.warning("[%s] %s; will retry on the next run", account.name, exc)
         except PublishError as exc:
             log.error("[%s] %s", account.name, exc)
             failures += 1
