@@ -283,6 +283,19 @@ class InstagramClient:
         info = self._call("GET", container_id, fields="status_code")
         return info.get("status_code", "")
 
+    def find_live_media(self, caption: str) -> str | None:
+        """Media id of a recent post whose caption matches, or None.
+
+        The source of truth for "is this already published?", independent of
+        container status or our own log (which a crashed run may not have saved).
+        """
+        data = self._call("GET", f"{self._user_id}/media", fields="id,caption", limit="50")
+        wanted = caption.strip()
+        return next(
+            (m["id"] for m in data.get("data", []) if (m.get("caption") or "").strip() == wanted),
+            None,
+        )
+
     def latest_media_id(self) -> str:
         data = self._call("GET", f"{self._user_id}/media", fields="id", limit="1")
         items = data.get("data") or []
@@ -383,13 +396,20 @@ def _run_account(account: Account, args: argparse.Namespace, now: datetime) -> N
         raise PublishError(f"missing secrets {account.token_var} / {account.user_id_var}")
     client = InstagramClient(user_id, token)
 
+    # Ask Instagram first: if this post is already live, just record it.
+    live_id = client.find_live_media(post.caption)
+    if live_id:
+        log.warning("[%s] %s is already live (media %s); recording it", account.name, post.id, live_id)
+        _record(account, state, entries, post, live_id, now)
+        return
+
+    container_id = ""
     if pending and pending["post"] == post.id:
         container_id = pending["container_id"]
-        log.info("[%s] resuming %s (container %s)", account.name, post.id, container_id)
-        if client.container_status(container_id) in {"ERROR", "EXPIRED"}:
+        status = client.container_status(container_id)
+        log.info("[%s] resuming %s: container %s is %s", account.name, post.id, container_id, status)
+        if status != "FINISHED":
             container_id = ""
-    else:
-        container_id = ""
     if not container_id:
         container_id = create_container(client, post, args.repo, args.ref)
         # Persist before publishing: if publish errors, the next run resumes this container.
@@ -397,10 +417,16 @@ def _run_account(account: Account, args: argparse.Namespace, now: datetime) -> N
         write_state(account, state)
 
     media_id = finish_publish(client, container_id)
+    _record(account, state, entries, post, media_id or "unknown", now)
+
+
+def _record(
+    account: Account, state: dict, entries: list[dict], post: Post, media_id: str, now: datetime
+) -> None:
     entries.append(
         {
             "post": post.id,
-            "media_id": media_id or "unknown",
+            "media_id": media_id,
             "published_at": now.isoformat(timespec="seconds"),
             "local_date": now.astimezone(account.tz).date().isoformat(),
         }
