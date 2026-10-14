@@ -45,6 +45,8 @@ MAX_IMAGE_BYTES = 8 * 1024 * 1024
 HTTP_TIMEOUT = 30
 POLL_INTERVAL = 5
 POLL_TIMEOUT = 300
+LIVE_CHECK_TRIES = 8  # feed checks after a publish error (Instagram lags behind its own 403)
+LIVE_CHECK_INTERVAL = 10
 RETRIES = 3
 
 log = logging.getLogger("publish")
@@ -296,11 +298,6 @@ class InstagramClient:
             None,
         )
 
-    def latest_media_id(self) -> str:
-        data = self._call("GET", f"{self._user_id}/media", fields="id", limit="1")
-        items = data.get("data") or []
-        return items[0]["id"] if items else ""
-
     def publish(self, container_id: str) -> str:
         """Publish once. Never retried here: a lost response may still have gone live,
         so the caller must check container_status before trying again."""
@@ -335,27 +332,31 @@ def create_container(client: InstagramClient, post: Post, repo: str, ref: str) -
     return carousel
 
 
-def finish_publish(client: InstagramClient, container_id: str) -> str | None:
-    """Publish a ready container exactly once.
+def wait_until_live(client: InstagramClient, caption: str) -> str | None:
+    """Poll the feed for a just-published post; Instagram can take a while to show it."""
+    for attempt in range(LIVE_CHECK_TRIES):
+        if attempt:
+            time.sleep(LIVE_CHECK_INTERVAL)
+        try:
+            if media_id := client.find_live_media(caption):
+                return media_id
+        except PublishError:
+            continue  # throttled lookup; try again
+    return None
 
-    Returns the media id, or None when Instagram already published it (e.g. an
-    earlier run published but errored before we could record it).
+
+def finish_publish(client: InstagramClient, container_id: str, caption: str) -> str:
+    """Publish a ready container exactly once and return its media id.
+
+    media_publish can go live yet still return an error (e.g. a 403 "request limit"),
+    so after any error the feed, not the response, decides whether it worked.
     """
     try:
-        status = client.container_status(container_id)
-    except PublishError:
-        status = ""  # status check failed; fall through and try to publish
-    if status == "PUBLISHED":
-        return client.latest_media_id() or None
-    try:
         return client.publish(container_id)
-    except PublishError:
-        # The call may have succeeded server-side despite the error.
-        try:
-            if client.container_status(container_id) == "PUBLISHED":
-                return client.latest_media_id() or None
-        except PublishError:
-            pass
+    except PublishError as exc:
+        log.warning("publish returned an error (%s); checking the feed", exc)
+        if media_id := wait_until_live(client, caption):
+            return media_id
         raise
 
 
@@ -416,8 +417,8 @@ def _run_account(account: Account, args: argparse.Namespace, now: datetime) -> N
         state["pending"] = {"post": post.id, "container_id": container_id}
         write_state(account, state)
 
-    media_id = finish_publish(client, container_id)
-    _record(account, state, entries, post, media_id or "unknown", now)
+    media_id = finish_publish(client, container_id, post.caption)
+    _record(account, state, entries, post, media_id, now)
 
 
 def _record(
